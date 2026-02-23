@@ -201,6 +201,9 @@ open http://localhost:15672   # guest / guest
 
 # Interactive API docs
 open http://localhost:8000/docs
+
+# Run the full E2E smoke test suite (9 scenarios)
+python scripts/e2e_test.py
 ```
 
 ---

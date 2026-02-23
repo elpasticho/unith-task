@@ -39,6 +39,7 @@ async def receive_webhook(
         "timestamp_ms": x_webhook_timestamp,
         "signature": x_webhook_signature,
         "body": data,
+        "raw_body": body.decode("utf-8", errors="replace"),  # preserved for HMAC verification
         "received_at": int(time.time() * 1000),
     }
     _received.append(entry)

@@ -2,6 +2,35 @@
 
 Developer utility scripts. Not part of any service — run locally against a running stack.
 
+## `e2e_test.py`
+
+End-to-end smoke test suite. Runs 9 scenarios against the live docker-compose stack via HTTP.
+No pytest, no testcontainers — just plain `httpx` calls.
+
+```bash
+# Run against the default stack (API :8000, receiver :9001)
+python scripts/e2e_test.py
+
+# Custom URLs (e.g. staging)
+python scripts/e2e_test.py --api http://api:8000 --receiver http://receiver:9001
+```
+
+**Exit codes:** `0` = all pass, `1` = failures, `2` = connection error (stack not running).
+
+**Scenarios covered:**
+
+| # | Scenario | What it proves |
+|---|----------|----------------|
+| 1 | Health checks | API, DB, and RabbitMQ are all reachable |
+| 2 | Subscriber lifecycle | Create returns secret once; GET hides it; PATCH updates endpoint; appears in list |
+| 3 | Happy path | publish → enriched → delivered → receiver confirms event_type + payload |
+| 4 | Idempotency | Same `message_id` published 3× → exactly 1 `idempotency_keys` row, 1 `delivery_attempt` |
+| 5 | Multiple subscribers | One event → independent delivery to each active subscriber |
+| 6 | HMAC verification | Signature on received webhook is cryptographically valid; tampered body fails |
+| 7 | Failed delivery → retry | Bad endpoint → `status=failed` → fix endpoint → `POST /deliveries/{id}/retry` → `delivered` |
+| 8 | Pipeline stats | `/pipeline/stats` reflects delivered count and event totals |
+| 9 | Prometheus metrics | `/metrics` exposes all named counters/histograms with non-zero values |
+
 ## `publish_events.py`
 
 CLI tool to publish test events directly to RabbitMQ, bypassing the API. Useful for load testing, idempotency testing, and manual pipeline walkthroughs.
