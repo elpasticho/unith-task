@@ -36,30 +36,35 @@ flowchart TB
     %% ── Consumer service ─────────────────────────────────────────
     subgraph CONS["Consumer Service"]
         direction TB
+        C0["Size guard\nbody > 1 MB → ACK + discard"]
         C1["Receive message"]
         C2{{"Idempotency check\nINSERT … ON CONFLICT\nDO NOTHING RETURNING *"}}
         C3["Write idempotency_key\n+ delivery_attempts\nthen COMMIT"]
         C4(["ACK ✓  early"])
         C5["LLM Enrichment\nMockLLMProvider · OpenAI stub\ntenacity 3 retries"]
         C6["Persist enriched_payload\nstatus → enriched"]
-        RECON["Reconciler  every 60 s\nre-enqueue status=received\nrows older than 5 min"]
+        RECON["Supervised Reconciler  every 60 s\nbatch ≤ 100 rows older than 5 min\nre-enqueue · cap reconcile_count\npublish timeout 5 s"]
     end
 
     %% ── Delivery worker ──────────────────────────────────────────
     subgraph WORKER["Delivery Worker"]
         direction TB
         W1["SELECT FOR UPDATE SKIP LOCKED\nclaim batch → status in_flight"]
+        W1B["Re-fetch subscriber from DB\ncheck is_active + deleted_at"]
         W2["HTTP POST\nX-Webhook-Signature  HMAC-SHA256\nX-Webhook-Timestamp  replay guard\nX-Webhook-ID  subscriber idempotency"]
         W3{{"2xx?"}}
         W4["status → delivered"]
         W5["status → failed\nfull-jitter exponential backoff"]
         W6["status → dead\nafter max_attempts  default 10"]
+        WCLEAN["Periodic stale cleanup\nin_flight > 10 min → failed"]
     end
 
     %% ── Ingestion flow ───────────────────────────────────────────
     PUB               -->|"AMQP publish\npersistent message"| RMQ
     API               -->|"shared app.state\nRobustConnection"| RMQ
-    RMQ               --> C1
+    RMQ               --> C0
+    C0                -->|"too large → discard"| C4
+    C0                -->|"ok"| C1
     C1                --> C2
     C2                -->|"duplicate → skip"| C4
     C2                -->|"new"| C3
@@ -68,13 +73,16 @@ flowchart TB
     C4                --> C5
     C5                -->|"success"| C6
     C6                --> PG
-    C5                -->|"transient / fatal error"| PG
-    RECON             -->|"re-enqueue"| RMQ
-    RECON             <-->|"query stale rows"| PG
+    C5                -->|"fatal error → record error\nreset provider singleton"| PG
+    C5                -->|"transient error\nstatus stays received"| RECON
+    RECON             -->|"re-enqueue (≤ max cycles)"| RMQ
+    RECON             <-->|"query / update stale rows"| PG
 
     %% ── Delivery flow ────────────────────────────────────────────
     W1                <-->|"SELECT / UPDATE"| PG
-    W1                --> W2
+    W1                --> W1B
+    W1B               -->|"inactive or deleted → dead"| PG
+    W1B               -->|"active"| W2
     W2                -->|"POST + sig headers"| SUB
     W2                -->|"POST + sig headers"| RCV
     W2                --> W3
@@ -83,6 +91,7 @@ flowchart TB
     W3                -->|"no, attempts == max"| W6
     W4 & W5 & W6      --> PG
     W5                -->|"next_attempt_at scheduled"| W1
+    WCLEAN            <-->|"UPDATE stale in_flight → failed"| PG
 
     %% ── API ↔ DB ─────────────────────────────────────────────────
     API               <-->|"CRUD + stats queries"| PG
@@ -112,10 +121,10 @@ Zero rows returned → duplicate → ACK immediately, return. No SELECT-then-INS
 ### 2. Early ACK strategy
 The RabbitMQ message is ACKed right after the idempotency row and delivery attempts are committed — before enrichment begins. This means the consumer is never blocked by LLM latency or HTTP calls, and a broker restart cannot cause duplicate processing.
 
-A background **reconciler** runs every 60 seconds and re-enqueues any `idempotency_keys` rows stuck in `status='received'` for longer than 5 minutes, recovering from consumer crashes that occurred post-ACK.
+A background **reconciler** (supervised — auto-restarts on crash) runs every `RECONCILER_INTERVAL_SECONDS` (default 60 s) and re-enqueues any `idempotency_keys` rows stuck in `status='received'` for longer than `RECONCILER_STALE_MINUTES` (default 5 min), recovering from consumer crashes that occurred post-ACK. Each `exchange.publish()` in the reconciler has a 5 s timeout to prevent a hung broker from blocking the event loop. At most `RECONCILER_BATCH_SIZE` (default 100) rows are processed per cycle. After `RECONCILER_MAX_ATTEMPTS` (default 10) reconciler cycles the message is marked `status='failed'` and abandoned.
 
 ### 3. Delivery retries — `SELECT FOR UPDATE SKIP LOCKED`
-The delivery worker claims rows atomically by setting `status='in_flight'` inside a transaction, then releases the lock before making the HTTP call. Multiple worker instances coordinate without deadlock. On worker startup, any `in_flight` rows older than 10 minutes are reset to `failed` (crash recovery).
+The delivery worker claims rows atomically by setting `status='in_flight'` inside a transaction, then releases the lock before making the HTTP call. Multiple worker instances coordinate without deadlock. On startup **and on a recurring periodic task**, any `in_flight` rows older than `DELIVERY_STALE_IN_FLIGHT_MINUTES` (default 10 min) are reset to `failed` (crash recovery). The subscriber row is re-fetched from the database immediately before each HTTP call so a subscriber deactivated or deleted after the batch was claimed is never delivered to.
 
 Backoff: full-jitter exponential — `delay = random(0, min(base × 2^attempt, 300s))`. After `max_attempts` (default 10) → `status='dead'`. Dead deliveries can be manually reset via `POST /api/v1/deliveries/{id}/retry`.
 
@@ -134,11 +143,11 @@ Secret is generated with `secrets.token_hex(32)` at registration, shown **once**
 - `OpenAILLMProvider`: fully wired stub — calls Chat Completions with JSON-mode prompt; enabled via `ENRICHMENT_PROVIDER=openai`
 - Provider singleton is reset to `None` on `FatalEnrichmentError` so the next message triggers re-creation (handles rotated API keys and stale client state)
 
-### 6. Shared RabbitMQ connection (API)
-The API uses a FastAPI lifespan-managed connection (`app/broker.py`) opened at startup and stored on `app.state`. All publish requests reuse the same connection instead of opening one per request.
+### 6. Shared connections — API lifespan
+The API uses a FastAPI lifespan-managed RabbitMQ connection (`app/broker.py`) opened at startup and stored on `app.state`. All publish requests reuse the same connection instead of opening one per request. The delivery worker's shared `httpx.AsyncClient` is also closed during lifespan shutdown (`close_client()`), ensuring the connection pool is drained cleanly before the process exits.
 
 ### 7. Observability
-- **Structured logging** via `structlog` — every key event carries named fields (`message_id`, `event_type`, `delivery_id`, etc.). Services use `JSONRenderer` when stdout is not a TTY (containers) and `ConsoleRenderer` for local development.
+- **Structured logging** via `structlog` — every key event carries named fields (`message_id`, `event_type`, `delivery_id`, etc.). Services detect `sys.stderr.isatty()`: `ConsoleRenderer` for local development (TTY), `JSONRenderer` + ISO timestamp for containers (non-TTY), making logs directly ingestible by ELK / CloudWatch / Splunk.
 - **Prometheus metrics** at `GET /metrics`:
   - `consumer_messages_received_total`
   - `consumer_messages_duplicate_total`
@@ -257,7 +266,8 @@ DELETE /api/v1/subscribers/{id}      Soft-delete
 POST   /api/v1/events/publish        Publish a test event to RabbitMQ
 GET    /api/v1/events/{message_id}   Event detail + enrichment + all delivery attempts
 
-GET    /api/v1/deliveries            List deliveries (filter: status, subscriber_id, message_id)
+GET    /api/v1/deliveries            List deliveries (filter: subscriber_id, message_id,
+                                     status ∈ pending|in_flight|delivered|failed|dead)
 POST   /api/v1/deliveries/{id}/retry Reset dead/failed delivery to pending
 
 GET    /api/v1/pipeline/stats        Queue depth + delivery/event counts by status
@@ -272,20 +282,27 @@ GET    /metrics                      Prometheus metrics
 ## Database Schema
 
 **`subscribers`** — Webhook consumer registry
+- `id` UUID PK, `name` VARCHAR(255), `endpoint` TEXT (validated as http/https URL)
+- `secret` VARCHAR(64) — `secrets.token_hex(32)`, shown once on creation, never re-exposed
+- `is_active` BOOLEAN, `created_at`, `updated_at`, `deleted_at` (soft-delete)
 
 **`idempotency_keys`** — One row per unique `message_id`
 - `status`: `received` → `enriched` → `dispatched` | `failed` (abandoned after max reconciler cycles)
-- `enriched_payload`: stored after LLM processing; used by delivery worker
-- `reconcile_count`: incremented each time the reconciler re-enqueues this message; capped at `RECONCILER_MAX_ATTEMPTS`
+- `raw_payload` JSONB, `enriched_payload` JSONB (null until enrichment succeeds)
+- `reconcile_count` INTEGER — incremented each time the reconciler re-enqueues; capped at `RECONCILER_MAX_ATTEMPTS`
+- `error` TEXT — populated on `FatalEnrichmentError` or reconciler abandonment
 
 **`delivery_attempts`** — One row per `(message_id, subscriber_id)`
 - `status`: `pending` → `in_flight` → `delivered` | `failed` → `dead`
+- `attempt_count` INTEGER, `last_http_status` INTEGER, `last_error` TEXT (includes first 500 chars of response body on failure)
+- `next_attempt_at` — backoff-scheduled next retry time
 - `UNIQUE (message_id, subscriber_id)` — prevents duplicate rows on redelivery
 
-Critical indexes:
-- `idempotency_keys.message_id` — PRIMARY KEY (conflict target)
+Indexes:
+- `idempotency_keys.message_id` — PRIMARY KEY (conflict target for `ON CONFLICT DO NOTHING`)
 - `delivery_attempts(message_id, subscriber_id)` — UNIQUE constraint
 - Partial index on `delivery_attempts(next_attempt_at) WHERE status IN ('pending', 'failed')` — delivery worker poll query
+- `delivery_attempts(message_id)`, `delivery_attempts(subscriber_id)`, `delivery_attempts(status)` — API filter queries
 
 ---
 
@@ -361,12 +378,12 @@ tarea-unith/
 ├── .env.example
 ├── app/
 │   ├── config.py           # pydantic-settings — all env vars
-│   ├── main.py             # FastAPI app factory + lifespan
+│   ├── main.py             # FastAPI app factory + lifespan + body-size middleware
 │   ├── broker.py           # lifespan-managed RabbitMQ connection
-│   ├── metrics.py          # Prometheus counters + histograms
+│   ├── metrics.py          # Prometheus counters, histograms + DB pool gauges
 │   ├── db/
 │   │   ├── models.py       # SQLAlchemy ORM (Subscriber, IdempotencyKey, DeliveryAttempt)
-│   │   └── session.py      # async engine + session factory + schema bootstrap
+│   │   └── session.py      # async engine + session factory + schema bootstrap + incremental migrations
 │   ├── api/
 │   │   ├── router.py
 │   │   ├── subscribers.py  # CRUD
@@ -377,14 +394,14 @@ tarea-unith/
 │   │   ├── event.py
 │   │   └── delivery.py
 │   ├── consumer/
-│   │   └── rabbitmq.py     # aio-pika consumer, idempotency, reconciler, provider singleton
+│   │   └── rabbitmq.py     # aio-pika consumer, idempotency, supervised reconciler, provider singleton
 │   ├── enricher/
 │   │   ├── base.py         # EnrichmentProvider ABC + error types
 │   │   ├── mock_llm.py     # log-normal latency + error injection
 │   │   └── openai_llm.py   # Chat Completions stub
 │   └── delivery/
-│       ├── worker.py       # SELECT FOR UPDATE SKIP LOCKED loop
-│       ├── sender.py       # httpx HTTP client
+│       ├── worker.py       # SELECT FOR UPDATE SKIP LOCKED loop + periodic stale cleanup
+│       ├── sender.py       # httpx singleton client + shutdown hook + response-body capture
 │       └── signing.py      # HMAC-SHA256 sign + verify
 ├── receiver/
 │   └── main.py             # test webhook receiver (in-memory log)
@@ -399,5 +416,8 @@ tarea-unith/
 │       ├── test_pipeline_e2e.py
 │       └── test_delivery_retry.py
 └── scripts/
+    ├── start.sh            # build + start stack, wait for healthy, print URLs
+    ├── stop.sh             # stop services (--volumes to wipe data)
+    ├── e2e_test.py         # 10-scenario smoke test suite (plain httpx, no pytest)
     └── publish_events.py   # CLI: publish N events, optional duplicates
 ```
