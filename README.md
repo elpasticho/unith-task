@@ -8,25 +8,84 @@ Built as a take-home assignment for a Senior Backend Engineer (LLM/AI) role at U
 
 ## Architecture
 
-```
-[RabbitMQ] ──► [consumer]
-                    │
-          idempotency check (Postgres)        ← ON CONFLICT DO NOTHING, no race condition
-                    │
-             LLM enrichment (mock/OpenAI)     ← provider singleton, tenacity retries
-                    │
-          write idempotency_key + delivery_attempts
-                    │
-                 ACK msg                      ← early ACK; reconciler handles crashes
-                    │
-[delivery_worker] ──► SELECT FOR UPDATE SKIP LOCKED
-                      │
-               HTTP POST + HMAC sig ──► [subscriber endpoint]
-                      │
-               update delivery_attempts (retry/dead/success)
+```mermaid
+flowchart TB
+    classDef infra  fill:#F59E0B,stroke:#B45309,color:#000
+    classDef svc    fill:#3B82F6,stroke:#1D4ED8,color:#fff
+    classDef ext    fill:#10B981,stroke:#047857,color:#fff
+    classDef decision fill:#8B5CF6,stroke:#6D28D9,color:#fff
 
-[api]      ── subscriber CRUD, event publish, delivery observation, /metrics
-[receiver] ── test webhook endpoint (logs + stores deliveries)
+    %% ── External actors ──────────────────────────────────────────
+    PUB([" Publisher\n API · scripts/publish_events.py "]):::ext
+    SUB([" Subscriber Endpoints "]):::ext
+    RCV([" Receiver :9001\n test webhook sink "]):::ext
+
+    %% ── Infrastructure ───────────────────────────────────────────
+    RMQ[("RabbitMQ\nevents queue")]:::infra
+    PG[("PostgreSQL\nsubscribers\nidempotency_keys\ndelivery_attempts")]:::infra
+
+    %% ── API service ──────────────────────────────────────────────
+    subgraph API["API Service  :8000"]
+        direction TB
+        A1["Subscriber CRUD"]
+        A2["POST /events/publish"]
+        A3["Delivery observation"]
+        A4["GET /metrics  Prometheus"]
+    end
+
+    %% ── Consumer service ─────────────────────────────────────────
+    subgraph CONS["Consumer Service"]
+        direction TB
+        C1["Receive message"]
+        C2{{"Idempotency check\nINSERT … ON CONFLICT\nDO NOTHING RETURNING *"}}
+        C3["Write idempotency_key\n+ delivery_attempts\nthen COMMIT"]
+        C4(["ACK ✓  early"])
+        C5["LLM Enrichment\nMockLLMProvider · OpenAI stub\ntenacity 3 retries"]
+        C6["Persist enriched_payload\nstatus → enriched"]
+        RECON["Reconciler  every 60 s\nre-enqueue status=received\nrows older than 5 min"]
+    end
+
+    %% ── Delivery worker ──────────────────────────────────────────
+    subgraph WORKER["Delivery Worker"]
+        direction TB
+        W1["SELECT FOR UPDATE SKIP LOCKED\nclaim batch → status in_flight"]
+        W2["HTTP POST\nX-Webhook-Signature  HMAC-SHA256\nX-Webhook-Timestamp  replay guard\nX-Webhook-ID  subscriber idempotency"]
+        W3{{"2xx?"}}
+        W4["status → delivered"]
+        W5["status → failed\nfull-jitter exponential backoff"]
+        W6["status → dead\nafter max_attempts  default 10"]
+    end
+
+    %% ── Ingestion flow ───────────────────────────────────────────
+    PUB               -->|"AMQP publish\npersistent message"| RMQ
+    API               -->|"shared app.state\nRobustConnection"| RMQ
+    RMQ               --> C1
+    C1                --> C2
+    C2                -->|"duplicate → skip"| C4
+    C2                -->|"new"| C3
+    C3                --> PG
+    C3                --> C4
+    C4                --> C5
+    C5                -->|"success"| C6
+    C6                --> PG
+    C5                -->|"transient / fatal error"| PG
+    RECON             -->|"re-enqueue"| RMQ
+    RECON             <-->|"query stale rows"| PG
+
+    %% ── Delivery flow ────────────────────────────────────────────
+    W1                <-->|"SELECT / UPDATE"| PG
+    W1                --> W2
+    W2                -->|"POST + sig headers"| SUB
+    W2                -->|"POST + sig headers"| RCV
+    W2                --> W3
+    W3                -->|"yes"| W4
+    W3                -->|"no, attempts < max"| W5
+    W3                -->|"no, attempts == max"| W6
+    W4 & W5 & W6      --> PG
+    W5                -->|"next_attempt_at scheduled"| W1
+
+    %% ── API ↔ DB ─────────────────────────────────────────────────
+    API               <-->|"CRUD + stats queries"| PG
 ```
 
 ### Services
