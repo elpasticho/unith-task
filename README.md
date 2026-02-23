@@ -173,8 +173,14 @@ The API uses a FastAPI lifespan-managed connection (`app/broker.py`) opened at s
 # Copy env vars
 cp .env.example .env
 
-# Start all services
-docker compose up --build
+# Start all services (builds, starts, waits for healthy)
+bash scripts/start.sh
+
+# Stop (keeps data volumes)
+bash scripts/stop.sh
+
+# Stop and wipe all data
+bash scripts/stop.sh --volumes
 
 # Register a subscriber pointing at the test receiver
 curl -X POST http://localhost:8000/api/v1/subscribers \

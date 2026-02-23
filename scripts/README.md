@@ -2,6 +2,28 @@
 
 Developer utility scripts. Not part of any service — run locally against a running stack.
 
+## `start.sh`
+
+Builds and starts the full docker-compose stack, then waits until the API is healthy before returning.
+
+```bash
+bash scripts/start.sh
+```
+
+Prints URLs for the API, docs, metrics, receiver, and RabbitMQ management UI when ready.
+
+## `stop.sh`
+
+Stops all services. Data volumes are preserved by default so the database survives restarts.
+
+```bash
+# Stop services, keep volumes (database + queue data intact)
+bash scripts/stop.sh
+
+# Stop services AND delete volumes (clean slate)
+bash scripts/stop.sh --volumes
+```
+
 ## `e2e_test.py`
 
 End-to-end smoke test suite. Runs 9 scenarios against the live docker-compose stack via HTTP.
