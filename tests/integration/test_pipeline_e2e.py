@@ -3,17 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
+import secrets
 import uuid
 from unittest.mock import AsyncMock, patch
 
 import aio_pika
-import pytest
-import pytest_asyncio
-import respx
 import httpx
-
+import pytest
+import respx
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 
 @pytest.mark.asyncio
@@ -21,16 +20,15 @@ async def test_full_pipeline(containers, db_session):
     """
     1. Register a subscriber
     2. Publish an event to RabbitMQ
-    3. Run the consumer handle_message once
-    4. Assert idempotency_key created + delivery_attempt created
-    5. Run one delivery_worker batch with mocked HTTP
+    3. Run handle_message (real enrichment, sleep patched for speed)
+    4. Assert idempotency_key created + enriched
+    5. Deliver via worker with mocked HTTP endpoint
     6. Assert delivery status = delivered
     """
     from app.db.models import DeliveryAttempt, IdempotencyKey, Subscriber
     from app.consumer.rabbitmq import handle_message
 
     # 1. Register subscriber
-    import secrets
     sub = Subscriber(
         name="e2e-test",
         endpoint="http://mock-receiver/webhook",
@@ -42,8 +40,6 @@ async def test_full_pipeline(containers, db_session):
     await db_session.refresh(sub)
 
     message_id = str(uuid.uuid4())
-
-    # 2. Create a fake RabbitMQ message
     msg_body = json.dumps(
         {
             "message_id": message_id,
@@ -52,6 +48,7 @@ async def test_full_pipeline(containers, db_session):
         }
     ).encode()
 
+    # Build a fake aio-pika message
     fake_msg = AsyncMock(spec=aio_pika.IncomingMessage)
     fake_msg.body = msg_body
     fake_msg.ack = AsyncMock()
@@ -64,33 +61,28 @@ async def test_full_pipeline(containers, db_session):
 
     fake_msg.process = _process
 
-    # Patch the enricher to avoid actual LLM calls and sleep
-    from app.enricher.base import EnrichedEvent
-
-    async def fast_enrich(provider, event_type, payload):
-        return EnrichedEvent(
-            event_type=event_type,
-            original_payload=payload,
-            enriched_payload={**payload, "_enrichment": {"summary": "test"}},
-            model="mock",
-            tokens_used=10,
-        )
-
-    with patch("app.consumer.rabbitmq._enrich_with_retry", side_effect=fast_enrich):
+    # 2. Run handle_message with real enrichment code path.
+    #    Patch asyncio.sleep so the mock LLM latency doesn't slow the test,
+    #    and pin random() so we always get a success (no error injection).
+    import random as _random
+    with patch("asyncio.sleep", new=AsyncMock()), \
+         patch.object(_random, "random", return_value=0.5):
         await handle_message(fake_msg)
 
-    # Give asyncio a moment
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.05)
 
-    # 3. Assert idempotency_key row created
+    # 3. Assert idempotency_key row exists and was enriched
     result = await db_session.execute(
         select(IdempotencyKey).where(IdempotencyKey.message_id == message_id)
     )
     ik = result.scalar_one_or_none()
     assert ik is not None, "idempotency_key should exist"
     assert ik.event_type == "user.purchase"
+    assert ik.enriched_payload is not None, "payload should be enriched"
+    assert "_enrichment" in ik.enriched_payload
+    assert ik.status == "enriched"
 
-    # 4. Assert delivery_attempt created
+    # 4. Assert delivery_attempt was created
     result = await db_session.execute(
         select(DeliveryAttempt).where(DeliveryAttempt.message_id == message_id)
     )
@@ -98,34 +90,21 @@ async def test_full_pipeline(containers, db_session):
     assert attempt is not None, "delivery_attempt should exist"
     assert attempt.subscriber_id == sub.id
 
-    # 5. Simulate delivery worker with mocked HTTP
-    with respx.mock:
-        respx.post("http://mock-receiver/webhook").mock(
+    # 5. Deliver via worker with mocked HTTP
+    import app.delivery.sender as sender_module
+
+    with respx.mock(assert_all_called=False) as rmock:
+        rmock.post("http://mock-receiver/webhook").mock(
             return_value=httpx.Response(200, json={"status": "ok"})
         )
-
-        # Patch delivery sender to use our mock
-        import app.delivery.sender as sender_module
-        original_client = sender_module._CLIENT
         sender_module._CLIENT = httpx.AsyncClient(
-            transport=respx.MockTransport(respx.current()),
+            transport=respx.MockTransport(rmock),
             timeout=5.0,
         )
-
         try:
-            from app.delivery.worker import _deliver_attempt
-            # Reload attempt with relationships
-            result = await db_session.execute(
-                select(DeliveryAttempt)
-                .where(DeliveryAttempt.message_id == message_id)
-            )
-            attempt = result.scalar_one()
-            # manually set in_flight so worker picks it up
             attempt.status = "in_flight"
             await db_session.commit()
 
-            # Load relationships
-            from sqlalchemy.orm import selectinload
             result = await db_session.execute(
                 select(DeliveryAttempt)
                 .where(DeliveryAttempt.message_id == message_id)
@@ -134,19 +113,21 @@ async def test_full_pipeline(containers, db_session):
                     selectinload(DeliveryAttempt.subscriber),
                 )
             )
-            attempt_loaded = result.scalar_one()
-            await _deliver_attempt(attempt_loaded)
+            loaded = result.scalar_one()
+
+            from app.delivery.worker import _deliver_attempt
+            await _deliver_attempt(loaded)
         finally:
-            sender_module._CLIENT = original_client
+            await sender_module._CLIENT.aclose()
+            sender_module._CLIENT = None
 
     # 6. Assert delivered
-    await db_session.refresh(attempt)
     result = await db_session.execute(
         select(DeliveryAttempt).where(DeliveryAttempt.message_id == message_id)
     )
-    final_attempt = result.scalar_one()
-    assert final_attempt.status == "delivered", f"Expected delivered, got {final_attempt.status}"
-    assert final_attempt.last_http_status == 200
+    final = result.scalar_one()
+    assert final.status == "delivered", f"Expected delivered, got {final.status}"
+    assert final.last_http_status == 200
 
 
 @pytest.mark.asyncio
@@ -154,22 +135,13 @@ async def test_duplicate_message_skipped(containers, db_session):
     """Publishing the same message_id twice → second is a no-op."""
     from app.db.models import IdempotencyKey
     from app.consumer.rabbitmq import handle_message
-    from app.enricher.base import EnrichedEvent
 
     message_id = str(uuid.uuid4())
-
     msg_body = json.dumps(
         {"message_id": message_id, "event_type": "test.dedup", "payload": {}}
     ).encode()
 
-    async def _fast_enrich(provider, event_type, payload):
-        return EnrichedEvent(
-            event_type=event_type,
-            original_payload=payload,
-            enriched_payload={**payload, "_enrichment": {}},
-            model="mock",
-            tokens_used=0,
-        )
+    import random as _random
 
     def make_fake_msg():
         fake_msg = AsyncMock(spec=aio_pika.IncomingMessage)
@@ -184,13 +156,62 @@ async def test_duplicate_message_skipped(containers, db_session):
         fake_msg.process = _process
         return fake_msg
 
-    with patch("app.consumer.rabbitmq._enrich_with_retry", side_effect=_fast_enrich):
+    with patch("asyncio.sleep", new=AsyncMock()), \
+         patch.object(_random, "random", return_value=0.5):
         await handle_message(make_fake_msg())
         await handle_message(make_fake_msg())
 
-    # Only one idempotency_key should exist
     result = await db_session.execute(
         select(IdempotencyKey).where(IdempotencyKey.message_id == message_id)
     )
     keys = result.scalars().all()
     assert len(keys) == 1, f"Expected 1 idempotency key, got {len(keys)}"
+
+
+@pytest.mark.asyncio
+async def test_reconciler_re_enqueues_stale_received(containers, db_session):
+    """Idempotency keys stuck in 'received' for > stale_minutes should be re-enqueued."""
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from app.db.models import IdempotencyKey
+    from app.consumer.rabbitmq import _reconciler
+
+    # Insert a stale 'received' key
+    stale_id = f"stale-{uuid.uuid4()}"
+    ik = IdempotencyKey(
+        message_id=stale_id,
+        event_type="test.stale",
+        raw_payload={"x": 1},
+        status="received",
+        received_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+    )
+    db_session.add(ik)
+    await db_session.commit()
+
+    # Mock exchange.publish and make reconciler run one cycle then stop
+    published: list[str] = []
+
+    async def fake_publish(msg, routing_key):
+        body = json.loads(msg.body)
+        published.append(body["message_id"])
+
+    mock_exchange = MagicMock()
+    mock_exchange.publish = fake_publish
+
+    # Patch sleep so the first sleep completes instantly, second call raises to break the loop
+    call_count = 0
+
+    async def controlled_sleep(_):
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            raise asyncio.CancelledError()
+
+    with patch("asyncio.sleep", side_effect=controlled_sleep):
+        try:
+            await _reconciler(None, mock_exchange)
+        except asyncio.CancelledError:
+            pass
+
+    assert stale_id in published, f"Stale key {stale_id} was not re-enqueued"

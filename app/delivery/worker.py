@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import math
 import random
+import time
 from datetime import datetime, timedelta, timezone
 
 import structlog
@@ -14,6 +15,13 @@ from app.config import settings
 from app.db.models import DeliveryAttempt, IdempotencyKey, Subscriber
 from app.db.session import AsyncSessionLocal
 from app.delivery.sender import deliver
+from app.metrics import (
+    deliveries_attempted,
+    deliveries_dead,
+    deliveries_failed,
+    deliveries_succeeded,
+    delivery_duration,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -105,16 +113,21 @@ async def _deliver_attempt(attempt: DeliveryAttempt) -> None:
         return
 
     payload = ik.enriched_payload or ik.raw_payload
+    deliveries_attempted.inc()
+    t0 = time.perf_counter()
     result = await deliver(attempt.id, sub.endpoint, sub.secret, ik.event_type, payload)
+    delivery_duration.observe(time.perf_counter() - t0)
 
     now = datetime.now(timezone.utc)
     new_attempt_count = attempt.attempt_count + 1
 
     if result.success:
+        deliveries_succeeded.inc()
         new_status = "delivered"
         next_attempt_at = now  # irrelevant
         last_error = None
     elif new_attempt_count >= settings.delivery_max_attempts:
+        deliveries_dead.inc()
         new_status = "dead"
         next_attempt_at = now
         last_error = result.error or f"HTTP {result.status_code}"
@@ -126,6 +139,8 @@ async def _deliver_attempt(attempt: DeliveryAttempt) -> None:
             attempts=new_attempt_count,
         )
     else:
+        status_label = str(result.status_code) if result.status_code else "timeout"
+        deliveries_failed.labels(http_status=status_label).inc()
         new_status = "failed"
         delay = _backoff_seconds(new_attempt_count)
         next_attempt_at = now + timedelta(seconds=delay)

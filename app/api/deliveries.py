@@ -81,10 +81,13 @@ async def pipeline_stats(db: AsyncSession = Depends(get_db)) -> PipelineStats:
     queue_depth = 0
     try:
         import httpx
+        url = (
+            f"{settings.rabbitmq_management_url}/api/queues/%2F/{settings.rabbitmq_queue}"
+        )
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.get(
-                f"http://rabbitmq:15672/api/queues/%2F/{settings.rabbitmq_queue}",
-                auth=("guest", "guest"),
+                url,
+                auth=(settings.rabbitmq_management_user, settings.rabbitmq_management_password),
             )
             if resp.status_code == 200:
                 queue_depth = resp.json().get("messages", 0)

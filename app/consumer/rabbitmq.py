@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aio_pika
 import structlog
@@ -15,9 +16,25 @@ from app.config import settings
 from app.db.models import DeliveryAttempt, IdempotencyKey, Subscriber
 from app.db.session import AsyncSessionLocal
 from app.enricher import get_provider
-from app.enricher.base import FatalEnrichmentError, TransientEnrichmentError
+from app.enricher.base import EnrichmentProvider, FatalEnrichmentError, TransientEnrichmentError
+from app.metrics import (
+    enrichment_duration,
+    enrichment_errors,
+    messages_duplicate,
+    messages_received,
+)
 
 logger = structlog.get_logger(__name__)
+
+# Module-level singleton — instantiated once at startup, reused for every message.
+_provider: EnrichmentProvider | None = None
+
+
+def _get_provider() -> EnrichmentProvider:
+    global _provider
+    if _provider is None:
+        _provider = get_provider()
+    return _provider
 
 
 async def _insert_idempotency_key(
@@ -106,22 +123,26 @@ async def handle_message(message: aio_pika.IncomingMessage) -> None:
             ik = await _insert_idempotency_key(session, message_id, event_type, payload)
             if ik is None:
                 log.info("consumer.duplicate_skipped")
+                messages_duplicate.inc()
                 await message.ack()
                 return
 
             # Step 2: Create delivery attempts (so we don't lose them if we crash after ACK)
             sub_count = await _create_delivery_attempts(session, message_id)
             await session.commit()
+            messages_received.inc()
             log.info("consumer.received", subscriber_count=sub_count)
 
         # Step 3: ACK early — idempotency row ensures safety
         await message.ack()
 
         # Step 4: Enrich (after ACK)
-        provider = get_provider()
+        provider = _get_provider()
         enriched_payload: dict | None = None
         try:
+            t0 = time.perf_counter()
             result = await _enrich_with_retry(provider, event_type, payload)
+            enrichment_duration.observe(time.perf_counter() - t0)
             enriched_payload = result.enriched_payload
             log.info(
                 "consumer.enriched",
@@ -129,10 +150,12 @@ async def handle_message(message: aio_pika.IncomingMessage) -> None:
                 tokens=result.tokens_used,
             )
         except TransientEnrichmentError as exc:
+            enrichment_errors.labels(error_type="transient").inc()
             log.warning("consumer.transient_enrichment_failed", error=str(exc))
             # Reconciler will retry later (status stays 'received')
             return
         except FatalEnrichmentError as exc:
+            enrichment_errors.labels(error_type="fatal").inc()
             log.error("consumer.fatal_enrichment_failed", error=str(exc))
             async with AsyncSessionLocal() as session:
                 result2 = await session.execute(
@@ -165,7 +188,7 @@ async def _reconciler(channel: aio_pika.Channel, exchange: aio_pika.Exchange) ->
     while True:
         await asyncio.sleep(settings.reconciler_interval_seconds)
         try:
-            cutoff = datetime.now(timezone.utc) - __import__("datetime").timedelta(
+            cutoff = datetime.now(timezone.utc) - timedelta(
                 minutes=settings.reconciler_stale_minutes
             )
             async with AsyncSessionLocal() as session:

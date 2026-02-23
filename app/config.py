@@ -34,5 +34,10 @@ class Settings(BaseSettings):
     reconciler_stale_minutes: int = 5
     reconciler_interval_seconds: int = 60
 
+    # RabbitMQ management API (for queue depth in /pipeline/stats)
+    rabbitmq_management_url: str = "http://rabbitmq:15672"
+    rabbitmq_management_user: str = "guest"
+    rabbitmq_management_password: str = "guest"
+
 
 settings = Settings()

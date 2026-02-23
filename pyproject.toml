@@ -17,6 +17,7 @@ dependencies = [
     "tenacity>=8.3.0",
     "structlog>=24.1.0",
     "python-ulid>=2.0.0",
+    "prometheus-client>=0.20.0",
 ]
 
 [project.optional-dependencies]

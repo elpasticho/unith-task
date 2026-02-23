@@ -1,10 +1,9 @@
 """Integration test: delivery retry logic — 503 twice then 200."""
 from __future__ import annotations
 
-import asyncio
-import json
 import secrets
 import uuid
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
@@ -14,19 +13,45 @@ from sqlalchemy.orm import selectinload
 
 from app.db.models import DeliveryAttempt, IdempotencyKey, Subscriber
 from app.delivery.worker import _deliver_attempt, _backoff_seconds
+import app.delivery.sender as sender_module
+
+
+@asynccontextmanager
+async def _mock_http(pattern: str, responses: list[httpx.Response]):
+    """Context manager that serves responses in sequence for a given URL pattern."""
+    iter_responses = iter(responses)
+
+    with respx.mock(assert_all_called=False) as rmock:
+        rmock.post(pattern).mock(side_effect=lambda _: next(iter_responses))
+        client = httpx.AsyncClient(transport=respx.MockTransport(rmock), timeout=5.0)
+        original = sender_module._CLIENT
+        sender_module._CLIENT = client
+        try:
+            yield
+        finally:
+            await client.aclose()
+            sender_module._CLIENT = original
+
+
+async def _load(db_session, attempt_id) -> DeliveryAttempt:
+    result = await db_session.execute(
+        select(DeliveryAttempt)
+        .where(DeliveryAttempt.id == attempt_id)
+        .options(
+            selectinload(DeliveryAttempt.idempotency_key),
+            selectinload(DeliveryAttempt.subscriber),
+        )
+    )
+    return result.scalar_one()
 
 
 @pytest.mark.asyncio
 async def test_retry_503_twice_then_200(containers, db_session):
     """
-    Delivery worker should:
-    1. First attempt → 503 → status=failed, attempt_count=1
-    2. Second attempt → 503 → status=failed, attempt_count=2
-    3. Third attempt → 200 → status=delivered, attempt_count=3
+    Attempt 1 → 503 → failed (count=1)
+    Attempt 2 → 503 → failed (count=2)
+    Attempt 3 → 200 → delivered (count=3)
     """
-    import app.delivery.sender as sender_module
-
-    # Setup subscriber + event
     sub = Subscriber(
         name="retry-test",
         endpoint="http://retry-mock/webhook",
@@ -56,89 +81,41 @@ async def test_retry_503_twice_then_200(containers, db_session):
     db_session.add(attempt)
     await db_session.commit()
     await db_session.refresh(attempt)
-
-    async def _load_attempt():
-        result = await db_session.execute(
-            select(DeliveryAttempt)
-            .where(DeliveryAttempt.id == attempt.id)
-            .options(
-                selectinload(DeliveryAttempt.idempotency_key),
-                selectinload(DeliveryAttempt.subscriber),
-            )
-        )
-        return result.scalar_one()
+    attempt_id = attempt.id
 
     # Attempt 1: 503
-    with respx.mock(assert_all_called=False):
-        respx.post("http://retry-mock/webhook").mock(
-            return_value=httpx.Response(503)
-        )
-        loaded = await _load_attempt()
-        original_client = sender_module._CLIENT
-        sender_module._CLIENT = httpx.AsyncClient(
-            transport=respx.MockTransport(respx.current()),
-            timeout=5.0,
-        )
-        try:
-            await _deliver_attempt(loaded)
-        finally:
-            sender_module._CLIENT = original_client
+    async with _mock_http("http://retry-mock/webhook", [httpx.Response(503)]):
+        loaded = await _load(db_session, attempt_id)
+        await _deliver_attempt(loaded)
 
-    await db_session.refresh(attempt)
-    result = await db_session.execute(
-        select(DeliveryAttempt).where(DeliveryAttempt.id == attempt.id)
-    )
+    result = await db_session.execute(select(DeliveryAttempt).where(DeliveryAttempt.id == attempt_id))
     a1 = result.scalar_one()
     assert a1.status == "failed"
     assert a1.attempt_count == 1
     assert a1.last_http_status == 503
 
-    # Attempt 2: 503 again
+    # Attempt 2: 503
     a1.status = "in_flight"
     await db_session.commit()
 
-    with respx.mock(assert_all_called=False):
-        respx.post("http://retry-mock/webhook").mock(
-            return_value=httpx.Response(503)
-        )
-        loaded = await _load_attempt()
-        sender_module._CLIENT = httpx.AsyncClient(
-            transport=respx.MockTransport(respx.current()),
-            timeout=5.0,
-        )
-        try:
-            await _deliver_attempt(loaded)
-        finally:
-            sender_module._CLIENT = original_client
+    async with _mock_http("http://retry-mock/webhook", [httpx.Response(503)]):
+        loaded = await _load(db_session, attempt_id)
+        await _deliver_attempt(loaded)
 
-    result = await db_session.execute(
-        select(DeliveryAttempt).where(DeliveryAttempt.id == attempt.id)
-    )
+    result = await db_session.execute(select(DeliveryAttempt).where(DeliveryAttempt.id == attempt_id))
     a2 = result.scalar_one()
     assert a2.status == "failed"
     assert a2.attempt_count == 2
 
-    # Attempt 3: 200 success
+    # Attempt 3: 200
     a2.status = "in_flight"
     await db_session.commit()
 
-    with respx.mock(assert_all_called=False):
-        respx.post("http://retry-mock/webhook").mock(
-            return_value=httpx.Response(200, json={"status": "ok"})
-        )
-        loaded = await _load_attempt()
-        sender_module._CLIENT = httpx.AsyncClient(
-            transport=respx.MockTransport(respx.current()),
-            timeout=5.0,
-        )
-        try:
-            await _deliver_attempt(loaded)
-        finally:
-            sender_module._CLIENT = original_client
+    async with _mock_http("http://retry-mock/webhook", [httpx.Response(200, json={"status": "ok"})]):
+        loaded = await _load(db_session, attempt_id)
+        await _deliver_attempt(loaded)
 
-    result = await db_session.execute(
-        select(DeliveryAttempt).where(DeliveryAttempt.id == attempt.id)
-    )
+    result = await db_session.execute(select(DeliveryAttempt).where(DeliveryAttempt.id == attempt_id))
     a3 = result.scalar_one()
     assert a3.status == "delivered"
     assert a3.attempt_count == 3
@@ -147,9 +124,8 @@ async def test_retry_503_twice_then_200(containers, db_session):
 
 @pytest.mark.asyncio
 async def test_dead_after_max_attempts(containers, db_session):
-    """After max_attempts consecutive failures, status becomes dead."""
+    """After max_attempts consecutive failures → status becomes dead."""
     from app.config import settings
-    import app.delivery.sender as sender_module
 
     sub = Subscriber(
         name="dead-test",
@@ -171,7 +147,7 @@ async def test_dead_after_max_attempts(containers, db_session):
     await db_session.refresh(sub)
     await db_session.refresh(ik)
 
-    # Start just below max_attempts
+    # Start one attempt below max so the next failure tips it to dead
     attempt = DeliveryAttempt(
         message_id=ik.message_id,
         subscriber_id=sub.id,
@@ -181,33 +157,13 @@ async def test_dead_after_max_attempts(containers, db_session):
     db_session.add(attempt)
     await db_session.commit()
     await db_session.refresh(attempt)
+    attempt_id = attempt.id
 
-    with respx.mock(assert_all_called=False):
-        respx.post("http://dead-mock/webhook").mock(
-            return_value=httpx.Response(500)
-        )
-        result = await db_session.execute(
-            select(DeliveryAttempt)
-            .where(DeliveryAttempt.id == attempt.id)
-            .options(
-                selectinload(DeliveryAttempt.idempotency_key),
-                selectinload(DeliveryAttempt.subscriber),
-            )
-        )
-        loaded = result.scalar_one()
-        original_client = sender_module._CLIENT
-        sender_module._CLIENT = httpx.AsyncClient(
-            transport=respx.MockTransport(respx.current()),
-            timeout=5.0,
-        )
-        try:
-            await _deliver_attempt(loaded)
-        finally:
-            sender_module._CLIENT = original_client
+    async with _mock_http("http://dead-mock/webhook", [httpx.Response(500)]):
+        loaded = await _load(db_session, attempt_id)
+        await _deliver_attempt(loaded)
 
-    result = await db_session.execute(
-        select(DeliveryAttempt).where(DeliveryAttempt.id == attempt.id)
-    )
+    result = await db_session.execute(select(DeliveryAttempt).where(DeliveryAttempt.id == attempt_id))
     final = result.scalar_one()
     assert final.status == "dead"
     assert final.attempt_count == settings.delivery_max_attempts
