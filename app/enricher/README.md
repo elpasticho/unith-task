@@ -37,7 +37,7 @@ Requires the `openai` Python package (not installed by default — add to `pypro
 ```python
 def get_provider() -> EnrichmentProvider
 ```
-Returns the correct provider based on `ENRICHMENT_PROVIDER`. Called once at consumer startup; the result is cached as a module-level singleton in `consumer/rabbitmq.py`.
+Returns the correct provider based on `ENRICHMENT_PROVIDER`. The result is cached as a module-level singleton (`_provider`) in `consumer/rabbitmq.py` and reused for every message. The singleton is reset to `None` on `FatalEnrichmentError` so a rotated API key or stale client is recovered automatically on the next message.
 
 ## Adding a new provider
 

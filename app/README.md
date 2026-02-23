@@ -16,9 +16,9 @@ The core application package. All services (API, consumer, delivery worker) impo
 | File | Purpose |
 |------|---------|
 | `config.py` | All configuration via pydantic-settings. Reads env vars / `.env` file. Single `settings` instance imported everywhere. |
-| `main.py` | FastAPI app factory. Registers routers, lifespan (opens/closes RabbitMQ connection), health endpoints. |
+| `main.py` | FastAPI app factory. Registers routers, `_BodySizeLimitMiddleware` (rejects oversized request bodies), lifespan (opens/closes RabbitMQ connection and shared HTTP client), health endpoints. |
 | `broker.py` | Lifespan-managed RabbitMQ connection stored on `app.state`. API routes call `get_exchange(request.app)` to publish without opening a new connection per request. |
-| `metrics.py` | Prometheus counters and histograms for the consumer and delivery worker. Exposed at `GET /metrics`. |
+| `metrics.py` | Prometheus counters, histograms, and DB connection pool gauges. Exposed at `GET /metrics`. Pool gauges are refreshed on every scrape. |
 
 ## Sub-packages
 

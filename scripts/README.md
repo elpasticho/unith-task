@@ -51,6 +51,8 @@ python scripts/e2e_test.py \
 
 The delivery worker runs inside the Docker network where `localhost` resolves to its own container. Subscriber endpoints must use the Docker-internal service name (`receiver`), not `localhost`.
 
+**Pre-run cleanup:** at the start of every run, `_pre_run_cleanup()` deletes any `e2e-*` subscribers left over from a previously aborted run. This prevents stale active subscribers from contaminating delivery counts (scenario 5) or HMAC secret mismatches (scenario 6).
+
 **Scenarios covered:**
 
 | # | Scenario | What it proves |

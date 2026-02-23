@@ -132,13 +132,13 @@ Secret is generated with `secrets.token_hex(32)` at registration, shown **once**
 - `EnrichmentProvider` ABC: `async def enrich(event_type, payload) → EnrichedEvent`
 - `MockLLMProvider`: log-normal latency (~0.8 s median), 8% transient errors, 2% fatal errors
 - `OpenAILLMProvider`: fully wired stub — calls Chat Completions with JSON-mode prompt; enabled via `ENRICHMENT_PROVIDER=openai`
-- Provider is instantiated once as a module-level singleton in the consumer (not per-message)
+- Provider singleton is reset to `None` on `FatalEnrichmentError` so the next message triggers re-creation (handles rotated API keys and stale client state)
 
 ### 6. Shared RabbitMQ connection (API)
 The API uses a FastAPI lifespan-managed connection (`app/broker.py`) opened at startup and stored on `app.state`. All publish requests reuse the same connection instead of opening one per request.
 
 ### 7. Observability
-- **Structured logging** via `structlog` — every key event carries named fields (`message_id`, `event_type`, `delivery_id`, etc.)
+- **Structured logging** via `structlog` — every key event carries named fields (`message_id`, `event_type`, `delivery_id`, etc.). Services use `JSONRenderer` when stdout is not a TTY (containers) and `ConsoleRenderer` for local development.
 - **Prometheus metrics** at `GET /metrics`:
   - `consumer_messages_received_total`
   - `consumer_messages_duplicate_total`
@@ -147,7 +147,10 @@ The API uses a FastAPI lifespan-managed connection (`app/broker.py`) opened at s
   - `delivery_attempts_total`, `delivery_successes_total`, `delivery_dead_total`
   - `delivery_failures_total{http_status}` — labeled by HTTP status code or `timeout`
   - `delivery_http_duration_seconds` — histogram
-- **`GET /api/v1/pipeline/stats`** — delivery counts by status + idempotency key counts + live queue depth from the RabbitMQ management API
+  - `db_pool_connections_checked_out` — live DB connection pool usage
+  - `db_pool_connections_overflow` — overflow connections in use
+  - `db_pool_size_configured` — configured pool size
+- **`GET /api/v1/pipeline/stats`** — delivery counts by status + idempotency key counts + live queue depth from the RabbitMQ management API. `queue_depth_available: false` and `queue_depth_error` are set when the management API is unreachable instead of silently returning 0.
 - **`GET /api/v1/events/{message_id}`** — trace a single event end-to-end: raw payload, enriched payload, status, all delivery attempts
 
 ---
@@ -157,13 +160,19 @@ The API uses a FastAPI lifespan-managed connection (`app/broker.py`) opened at s
 | Failure | How it's handled |
 |---------|-----------------|
 | RabbitMQ redelivers a message | `ON CONFLICT DO NOTHING` on `message_id` — duplicate is ACKed and discarded in one DB round-trip |
-| Consumer crashes after ACK, before enrichment | Reconciler detects `status='received'` rows > 5 min old and re-enqueues them |
-| Subscriber endpoint returns 5xx / times out | Delivery worker retries with full-jitter exponential backoff up to `max_attempts` |
-| Delivery worker crashes mid-delivery | On restart, stale `in_flight` rows > 10 min are reset to `failed` and retried |
+| Consumer crashes after ACK, before enrichment | Reconciler detects `status='received'` rows > 5 min old and re-enqueues them (capped at `RECONCILER_MAX_ATTEMPTS` cycles per message to prevent infinite loops) |
+| Reconciler task crashes | Supervised wrapper (`_supervised_reconciler`) restarts it automatically after a 5 s delay |
+| Enrichment provider has stale credentials | Provider singleton is reset to `None` on `FatalEnrichmentError`; fresh client created on next message |
+| Subscriber endpoint returns 5xx / times out | Delivery worker retries with full-jitter exponential backoff up to `max_attempts`; response body captured in `last_error` |
+| Subscriber deleted while delivery in-flight | Worker re-fetches subscriber from DB immediately before delivery; stale `is_active` state cannot cause a delivery to a deleted subscriber |
+| Delivery worker crashes mid-delivery | On restart, stale `in_flight` rows > 10 min are reset to `failed` and retried. A periodic background task repeats this cleanup throughout the process lifetime. |
 | All retries exhausted | `status='dead'`; operator can inspect via API and reset with `POST /deliveries/{id}/retry` |
 | Transient LLM error | tenacity retries up to 3 times; on final failure, reconciler picks it up later |
-| Fatal LLM error | Error recorded on the idempotency key row; reconciler retries after the stale window |
+| Fatal LLM error | Error recorded on the idempotency key row; reconciler retries up to `RECONCILER_MAX_ATTEMPTS` times then marks it `failed` |
 | Spoofed webhook | HMAC-SHA256 + timestamp tolerance rejects requests with invalid signatures or replayed timestamps |
+| Oversized RabbitMQ message | Message body is size-checked before `json.loads`; oversized messages are ACKed and discarded with an error log |
+| API request body too large | `_BodySizeLimitMiddleware` returns HTTP 413 when `Content-Length` exceeds `API_MAX_REQUEST_BODY_BYTES` (default 1 MB) |
+| RabbitMQ management API unreachable | `/pipeline/stats` returns `queue_depth_available: false` and `queue_depth_error` instead of silently reporting 0 |
 
 ---
 
@@ -242,7 +251,7 @@ docker compose logs consumer | grep <message_id>
 POST   /api/v1/subscribers           Register subscriber (returns secret once)
 GET    /api/v1/subscribers           List all active subscribers
 GET    /api/v1/subscribers/{id}      Get subscriber detail
-PATCH  /api/v1/subscribers/{id}      Update endpoint or is_active
+PATCH  /api/v1/subscribers/{id}      Update endpoint or is_active  [X-Idempotency-Key header supported]
 DELETE /api/v1/subscribers/{id}      Soft-delete
 
 POST   /api/v1/events/publish        Publish a test event to RabbitMQ
@@ -265,8 +274,9 @@ GET    /metrics                      Prometheus metrics
 **`subscribers`** — Webhook consumer registry
 
 **`idempotency_keys`** — One row per unique `message_id`
-- `status`: `received` → `enriched` → `dispatched`
+- `status`: `received` → `enriched` → `dispatched` | `failed` (abandoned after max reconciler cycles)
 - `enriched_payload`: stored after LLM processing; used by delivery worker
+- `reconcile_count`: incremented each time the reconciler re-enqueues this message; capped at `RECONCILER_MAX_ATTEMPTS`
 
 **`delivery_attempts`** — One row per `(message_id, subscriber_id)`
 - `status`: `pending` → `in_flight` → `delivered` | `failed` → `dead`
@@ -326,9 +336,16 @@ pytest tests/unit --cov=app --cov-report=term-missing
 | `WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS` | `300` | Replay attack window |
 | `RECONCILER_STALE_MINUTES` | `5` | Age before a `received` key is re-enqueued |
 | `RECONCILER_INTERVAL_SECONDS` | `60` | How often the reconciler runs |
+| `RECONCILER_MAX_ATTEMPTS` | `10` | Max reconciler cycles per message before it is abandoned (`status=failed`) |
+| `RECONCILER_BATCH_SIZE` | `100` | Max stale rows loaded per reconciler run |
 | `RABBITMQ_MANAGEMENT_URL` | `http://rabbitmq:15672` | Management API for queue depth in stats |
 | `RABBITMQ_MANAGEMENT_USER` | `guest` | Management API username |
 | `RABBITMQ_MANAGEMENT_PASSWORD` | `guest` | Management API password |
+| `DB_POOL_SIZE` | `10` | SQLAlchemy connection pool size per process |
+| `DB_MAX_OVERFLOW` | `20` | Max overflow connections above pool size |
+| `DB_POOL_TIMEOUT` | `30.0` | Seconds to wait for a connection before raising |
+| `CONSUMER_MAX_MESSAGE_BYTES` | `1048576` | Max RabbitMQ message body size (1 MB); larger messages are discarded |
+| `API_MAX_REQUEST_BODY_BYTES` | `1048576` | Max HTTP request body size (1 MB); larger requests get HTTP 413 |
 
 ---
 
