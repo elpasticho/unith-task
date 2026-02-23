@@ -4,14 +4,30 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.router import api_router
 from app.broker import connect as broker_connect, disconnect as broker_disconnect
+from app.config import settings
+from app.delivery.sender import close_client
 from app.metrics import router as metrics_router
 
 logger = structlog.get_logger(__name__)
+
+
+class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
+    """Reject requests whose Content-Length exceeds the configured limit."""
+
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > settings.api_max_request_body_bytes:
+            return JSONResponse(
+                {"detail": "Request body too large"},
+                status_code=413,
+            )
+        return await call_next(request)
 
 
 @asynccontextmanager
@@ -19,8 +35,9 @@ async def lifespan(app: FastAPI):
     # Startup: open shared RabbitMQ connection
     await broker_connect(app)
     yield
-    # Shutdown: close gracefully
+    # Shutdown: close RabbitMQ connection and shared HTTP client
     await broker_disconnect(app)
+    await close_client()
 
 
 def create_app() -> FastAPI:
@@ -31,6 +48,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    application.add_middleware(_BodySizeLimitMiddleware)
     application.include_router(api_router)
     application.include_router(metrics_router)
 

@@ -55,6 +55,7 @@ services:
       WEBHOOK_HMAC_SECRET_LENGTH: "32"
     ports:
       - "8000:8000"
+    stop_grace_period: 30s   # M6: allow in-flight HTTP requests to complete before SIGKILL
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,6 +73,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://unith:unith@postgres:5432/unith
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       ENRICHMENT_PROVIDER: mock
+    stop_grace_period: 30s   # M6: allow in-flight enrichment and DB writes to finish
     depends_on:
       postgres:
         condition: service_healthy
@@ -89,6 +91,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://unith:unith@postgres:5432/unith
       DELIVERY_MAX_ATTEMPTS: "10"
       DELIVERY_POLL_INTERVAL: "5"
+    stop_grace_period: 30s   # M6: allow the current delivery batch to finish before SIGKILL
     depends_on:
       postgres:
         condition: service_healthy

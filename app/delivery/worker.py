@@ -99,10 +99,15 @@ async def _process_batch() -> int:
 
 
 async def _deliver_attempt(attempt: DeliveryAttempt) -> None:
-    sub: Subscriber = attempt.subscriber
     ik: IdempotencyKey = attempt.idempotency_key
 
-    if not sub.is_active or sub.deleted_at is not None:
+    # H7: Re-fetch subscriber from DB to get current state.
+    # The selectinload copy may be stale if the subscriber was deleted/deactivated
+    # between the batch claim and this delivery attempt.
+    async with AsyncSessionLocal() as session:
+        sub = await session.get(Subscriber, attempt.subscriber_id)
+
+    if sub is None or not sub.is_active or sub.deleted_at is not None:
         async with AsyncSessionLocal() as session:
             await session.execute(
                 update(DeliveryAttempt)
@@ -169,9 +174,21 @@ async def _deliver_attempt(attempt: DeliveryAttempt) -> None:
         await session.commit()
 
 
+async def _periodic_stale_reset() -> None:
+    """H3: Run stale in-flight cleanup on a schedule, not just at startup."""
+    interval_seconds = settings.delivery_stale_in_flight_minutes * 60
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await _reset_stale_in_flight()
+        except Exception:
+            logger.exception("worker.periodic_stale_reset_error")
+
+
 async def run() -> None:
     logger.info("delivery_worker.starting")
     await _reset_stale_in_flight()
+    asyncio.create_task(_periodic_stale_reset())
     logger.info("delivery_worker.running", poll_interval=settings.delivery_poll_interval)
 
     while True:
@@ -185,12 +202,20 @@ async def run() -> None:
 
 
 if __name__ == "__main__":
+    import sys
     import structlog
 
+    # M4: Use JSON renderer in non-TTY environments (containers / log aggregators)
+    renderer = (
+        structlog.dev.ConsoleRenderer()
+        if sys.stderr.isatty()
+        else structlog.processors.JSONRenderer()
+    )
     structlog.configure(
         processors=[
             structlog.stdlib.add_log_level,
-            structlog.dev.ConsoleRenderer(),
+            structlog.processors.TimeStamper(fmt="iso"),
+            renderer,
         ]
     )
     asyncio.run(run())

@@ -4,7 +4,7 @@ Exposed at GET /metrics (text/plain; version=0.0.4).
 """
 from __future__ import annotations
 
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from fastapi import APIRouter
 from fastapi.responses import Response
 
@@ -54,7 +54,34 @@ delivery_duration = Histogram(
     buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
 )
 
+# ── Database connection pool (L4) ─────────────────────────────────────────────
+db_pool_checked_out = Gauge(
+    "db_pool_connections_checked_out",
+    "Database connections currently checked out from the pool",
+)
+db_pool_overflow = Gauge(
+    "db_pool_connections_overflow",
+    "Database pool overflow connections currently in use",
+)
+db_pool_size = Gauge(
+    "db_pool_size_configured",
+    "Configured database pool size (excludes overflow)",
+)
+
+
+def _update_pool_metrics() -> None:
+    """Refresh DB pool gauges from the live pool state (sync call, safe from any thread)."""
+    try:
+        from app.db.session import engine  # lazy import to avoid circular dependency
+        pool = engine.pool
+        db_pool_checked_out.set(pool.checkedout())
+        db_pool_overflow.set(pool.overflow())
+        db_pool_size.set(pool.size())
+    except Exception:
+        pass  # metrics are best-effort; never block a scrape
+
 
 @router.get("/metrics", include_in_schema=False)
 async def metrics() -> Response:
+    _update_pool_metrics()
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

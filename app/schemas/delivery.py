@@ -23,6 +23,9 @@ class DeliveryAttemptResponse(BaseModel):
 
 
 class PipelineStats(BaseModel):
-    queue_depth: int
+    # C5: queue_depth is None when the RabbitMQ management API is unreachable
+    queue_depth: Optional[int] = None
+    queue_depth_available: bool = True
+    queue_depth_error: Optional[str] = None
     deliveries_by_status: dict[str, int]
     idempotency_keys_by_status: dict[str, int]

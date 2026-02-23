@@ -50,11 +50,13 @@ class IdempotencyKey(Base):
     raw_payload = Column(JSONB, nullable=False)
     enriched_payload = Column(JSONB, nullable=True)
     status = Column(String(50), nullable=False, default="received")
-    # status: received | enriched | dispatched
+    # status: received | enriched | dispatched | failed
     received_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     enriched_at = Column(DateTime(timezone=True), nullable=True)
     dispatched_at = Column(DateTime(timezone=True), nullable=True)
     error = Column(Text, nullable=True)
+    reconcile_count = Column(Integer, nullable=False, default=0)
+    # NOTE: existing DBs need: ALTER TABLE idempotency_keys ADD COLUMN reconcile_count INTEGER NOT NULL DEFAULT 0;
 
     delivery_attempts = relationship("DeliveryAttempt", back_populates="idempotency_key")
 

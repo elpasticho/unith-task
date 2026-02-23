@@ -105,6 +105,16 @@ async def _enrich_with_retry(provider, event_type: str, payload: dict):
 
 async def handle_message(message: aio_pika.IncomingMessage) -> None:
     async with message.process(ignore_processed=True):
+        # H1: Guard against oversized payloads before parsing
+        if len(message.body) > settings.consumer_max_message_bytes:
+            logger.error(
+                "consumer.message_too_large",
+                size=len(message.body),
+                limit=settings.consumer_max_message_bytes,
+            )
+            await message.ack()  # discard; don't block the queue
+            return
+
         try:
             data = json.loads(message.body)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -157,6 +167,10 @@ async def handle_message(message: aio_pika.IncomingMessage) -> None:
         except FatalEnrichmentError as exc:
             enrichment_errors.labels(error_type="fatal").inc()
             log.error("consumer.fatal_enrichment_failed", error=str(exc))
+            # C4: Reset the provider singleton so the next message triggers re-creation
+            # (handles rotated API keys and stale client state)
+            global _provider
+            _provider = None
             async with AsyncSessionLocal() as session:
                 result2 = await session.execute(
                     select(IdempotencyKey).where(IdempotencyKey.message_id == message_id)
@@ -192,14 +206,31 @@ async def _reconciler(channel: aio_pika.Channel, exchange: aio_pika.Exchange) ->
                 minutes=settings.reconciler_stale_minutes
             )
             async with AsyncSessionLocal() as session:
+                # M2: LIMIT to avoid loading unbounded rows into memory
                 result = await session.execute(
-                    select(IdempotencyKey).where(
+                    select(IdempotencyKey)
+                    .where(
                         IdempotencyKey.status == "received",
                         IdempotencyKey.received_at < cutoff,
                     )
+                    .limit(settings.reconciler_batch_size)
                 )
                 stale = result.scalars().all()
                 for ik in stale:
+                    # M1: Cap reconcile cycles per message to prevent infinite re-enqueue loops
+                    if ik.reconcile_count >= settings.reconciler_max_attempts:
+                        logger.error(
+                            "reconciler.abandoned",
+                            message_id=ik.message_id,
+                            reconcile_count=ik.reconcile_count,
+                        )
+                        ik.status = "failed"
+                        ik.error = (
+                            f"Abandoned after {ik.reconcile_count} reconciler cycles "
+                            "(enrichment permanently unavailable)"
+                        )
+                        continue
+
                     msg_body = json.dumps(
                         {
                             "message_id": ik.message_id,
@@ -207,13 +238,45 @@ async def _reconciler(channel: aio_pika.Channel, exchange: aio_pika.Exchange) ->
                             "payload": ik.raw_payload,
                         }
                     ).encode()
-                    await exchange.publish(
-                        aio_pika.Message(body=msg_body),
-                        routing_key=settings.rabbitmq_queue,
+                    # H5: Timeout so a hung broker can't block the event loop indefinitely
+                    try:
+                        await asyncio.wait_for(
+                            exchange.publish(
+                                aio_pika.Message(body=msg_body),
+                                routing_key=settings.rabbitmq_queue,
+                            ),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error("reconciler.publish_timeout", message_id=ik.message_id)
+                        continue  # leave reconcile_count unchanged; retry next cycle
+
+                    ik.reconcile_count += 1
+                    logger.info(
+                        "reconciler.re_enqueued",
+                        message_id=ik.message_id,
+                        reconcile_count=ik.reconcile_count,
                     )
-                    logger.info("reconciler.re_enqueued", message_id=ik.message_id)
+
+                await session.commit()  # persist reconcile_count updates and status changes
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("reconciler.error")
+
+
+async def _supervised_reconciler(
+    channel: aio_pika.Channel, exchange: aio_pika.Exchange
+) -> None:
+    """C2: Run reconciler under supervision — restart automatically on unexpected crash."""
+    while True:
+        try:
+            await _reconciler(channel, exchange)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("reconciler.crashed_restarting")
+            await asyncio.sleep(5)
 
 
 async def run() -> None:
@@ -238,18 +301,27 @@ async def run() -> None:
 
         logger.info("consumer.ready", queue=settings.rabbitmq_queue)
 
-        # Start reconciler background task
-        asyncio.create_task(_reconciler(channel, exchange))
+        # C2: Start reconciler under supervision so a crash triggers an automatic restart
+        asyncio.create_task(_supervised_reconciler(channel, exchange))
 
         await queue.consume(handle_message)
         await asyncio.Future()  # block forever
 
 
 if __name__ == "__main__":
+    import sys
+
+    # M4: Use JSON renderer in non-TTY environments (containers / log aggregators)
+    renderer = (
+        structlog.dev.ConsoleRenderer()
+        if sys.stderr.isatty()
+        else structlog.processors.JSONRenderer()
+    )
     structlog.configure(
         processors=[
             structlog.stdlib.add_log_level,
-            structlog.dev.ConsoleRenderer(),
+            structlog.processors.TimeStamper(fmt="iso"),
+            renderer,
         ]
     )
     asyncio.run(run())

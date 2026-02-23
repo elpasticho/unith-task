@@ -544,12 +544,29 @@ class E2ERunner:
 
     # ── Main ──────────────────────────────────────────────────────────────────
 
+    def _pre_run_cleanup(self) -> None:
+        """Delete any e2e-* subscribers left over from a previously aborted run.
+
+        Without this, an aborted run leaves active subscribers in the DB which
+        causes subsequent runs to see more deliveries than expected (scenario 5)
+        and to receive webhooks signed with the wrong secret (scenario 6).
+        """
+        r = self.client.get(f"{self.api}/api/v1/subscribers")
+        if r.status_code != 200:
+            return
+        stale = [s for s in r.json() if s.get("name", "").startswith("e2e-")]
+        if stale:
+            print(f"\n{YELLOW}  ⚠  cleaning up {len(stale)} stale e2e subscriber(s) from a previous run{RESET}")
+            for s in stale:
+                self.client.delete(f"{self.api}/api/v1/subscribers/{s['id']}")
+
     def run(self) -> bool:
         print(f"\n{BOLD}Event Processing & Distribution Service — E2E Test Suite{RESET}")
         print(f"  API:                {self.api}")
         print(f"  Receiver (query):   {self.receiver}")
         print(f"  Subscriber endpoint:{self.subscriber_endpoint}  ← used by delivery worker")
 
+        self._pre_run_cleanup()
         self.test_health()
 
         (sub,) = self.test_subscriber_lifecycle()

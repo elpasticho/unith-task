@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from typing import List, Optional
 
 import aio_pika
@@ -18,9 +19,18 @@ from app.schemas.delivery import DeliveryAttemptResponse, PipelineStats
 router = APIRouter(tags=["deliveries"])
 
 
+class DeliveryStatus(str, Enum):
+    """M5: Enumerated delivery statuses — prevents silent no-match on typos."""
+    pending = "pending"
+    in_flight = "in_flight"
+    delivered = "delivered"
+    failed = "failed"
+    dead = "dead"
+
+
 @router.get("/deliveries", response_model=List[DeliveryAttemptResponse])
 async def list_deliveries(
-    status: Optional[str] = Query(None),
+    status: Optional[DeliveryStatus] = Query(None),
     subscriber_id: Optional[uuid.UUID] = Query(None),
     message_id: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
@@ -28,7 +38,7 @@ async def list_deliveries(
 ) -> List[DeliveryAttemptResponse]:
     stmt = select(DeliveryAttempt).order_by(DeliveryAttempt.created_at.desc()).limit(limit)
     if status:
-        stmt = stmt.where(DeliveryAttempt.status == status)
+        stmt = stmt.where(DeliveryAttempt.status == status.value)
     if subscriber_id:
         stmt = stmt.where(DeliveryAttempt.subscriber_id == subscriber_id)
     if message_id:
@@ -78,9 +88,12 @@ async def pipeline_stats(db: AsyncSession = Depends(get_db)) -> PipelineStats:
     ik_by_status = {row.status: row.cnt for row in ik_counts}
 
     # RabbitMQ queue depth via management API (best-effort)
-    queue_depth = 0
+    # C5: surface unavailability explicitly instead of silently returning 0
+    import httpx
+    queue_depth: int | None = None
+    queue_depth_available = True
+    queue_depth_error: str | None = None
     try:
-        import httpx
         url = (
             f"{settings.rabbitmq_management_url}/api/queues/%2F/{settings.rabbitmq_queue}"
         )
@@ -91,11 +104,23 @@ async def pipeline_stats(db: AsyncSession = Depends(get_db)) -> PipelineStats:
             )
             if resp.status_code == 200:
                 queue_depth = resp.json().get("messages", 0)
-    except Exception:
-        pass
+            else:
+                queue_depth_available = False
+                queue_depth_error = f"management API returned HTTP {resp.status_code}"
+    except Exception as exc:
+        queue_depth_available = False
+        queue_depth_error = str(exc)
+
+    if not queue_depth_available:
+        import structlog
+        structlog.get_logger(__name__).warning(
+            "pipeline_stats.queue_depth_unavailable", error=queue_depth_error
+        )
 
     return PipelineStats(
         queue_depth=queue_depth,
+        queue_depth_available=queue_depth_available,
+        queue_depth_error=queue_depth_error,
         deliveries_by_status=deliveries_by_status,
         idempotency_keys_by_status=ik_by_status,
     )

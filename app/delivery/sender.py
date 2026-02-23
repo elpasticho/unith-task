@@ -23,6 +23,14 @@ def _get_client() -> httpx.AsyncClient:
     return _CLIENT
 
 
+async def close_client() -> None:
+    """Close the shared HTTP client. Call during application shutdown."""
+    global _CLIENT
+    if _CLIENT is not None and not _CLIENT.is_closed:
+        await _CLIENT.aclose()
+    _CLIENT = None
+
+
 @dataclass
 class DeliveryResult:
     success: bool
@@ -58,6 +66,12 @@ async def deliver(
     try:
         resp = await client.post(endpoint, content=body_bytes, headers=headers)
         success = 200 <= resp.status_code < 300
+        error: str | None = None
+        if not success:
+            try:
+                error = resp.text[:500]  # capture first 500 chars of body for debugging
+            except Exception:
+                error = f"HTTP {resp.status_code}"
         log = logger.info if success else logger.warning
         log(
             "delivery.sent",
@@ -65,8 +79,9 @@ async def deliver(
             endpoint=endpoint,
             status_code=resp.status_code,
             success=success,
+            error=error,
         )
-        return DeliveryResult(success=success, status_code=resp.status_code, error=None)
+        return DeliveryResult(success=success, status_code=resp.status_code, error=error)
     except httpx.TimeoutException as exc:
         logger.warning("delivery.timeout", delivery_id=str(delivery_id), endpoint=endpoint, error=str(exc))
         return DeliveryResult(success=False, status_code=None, error=f"timeout: {exc}")
