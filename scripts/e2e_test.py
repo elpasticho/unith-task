@@ -23,6 +23,9 @@ Scenarios:
     7.  Failed delivery retry  — bad endpoint → failed → fix endpoint → manual retry → delivered
     8.  Pipeline stats         — counts reflect processed events
     9.  Prometheus metrics     — /metrics exposes expected metric names with non-zero values
+    10. API edge cases         — DELETE (soft-delete + 404 after), all 404 paths,
+                                 subscriber_id/status/limit filters on GET /deliveries,
+                                 409 on retry of delivered attempt
 """
 from __future__ import annotations
 
@@ -429,6 +432,86 @@ class E2ERunner:
             ),
         )
 
+    def test_api_edge_cases(self) -> None:
+        self.section("10. API Edge Cases & Full Endpoint Coverage")
+
+        # ── DELETE /api/v1/subscribers/{id} ──────────────────────────────────
+        temp = self._register_subscriber("e2e-delete-me", f"{self.receiver}/webhook")
+        temp_id = temp["id"]
+        self._cleanup_subs.remove(temp_id)  # we'll delete it here explicitly
+
+        r = self.client.delete(f"{self.api}/api/v1/subscribers/{temp_id}")
+        self.check("DELETE /subscribers/{id} → 204", r.status_code == 204)
+
+        # Deleted subscriber must not appear in list
+        r2 = self.client.get(f"{self.api}/api/v1/subscribers")
+        ids_after = [s["id"] for s in r2.json()]
+        self.check("soft-deleted subscriber absent from GET /subscribers list", temp_id not in ids_after)
+
+        # Deleted subscriber must 404 on GET
+        r3 = self.client.get(f"{self.api}/api/v1/subscribers/{temp_id}")
+        self.check("GET /subscribers/{id} on deleted → 404", r3.status_code == 404)
+
+        # DELETE again → 404 (already soft-deleted)
+        r4 = self.client.delete(f"{self.api}/api/v1/subscribers/{temp_id}")
+        self.check("DELETE /subscribers/{id} twice → 404", r4.status_code == 404)
+
+        # ── GET /events/{message_id} 404 ─────────────────────────────────────
+        r5 = self.client.get(f"{self.api}/api/v1/events/nonexistent-message-id-{uuid.uuid4()}")
+        self.check("GET /events/{message_id} for unknown ID → 404", r5.status_code == 404)
+
+        # ── GET /subscribers/{id} 404 ────────────────────────────────────────
+        r6 = self.client.get(f"{self.api}/api/v1/subscribers/{uuid.uuid4()}")
+        self.check("GET /subscribers/{id} for unknown ID → 404", r6.status_code == 404)
+
+        # ── GET /deliveries?subscriber_id= filter ────────────────────────────
+        # Publish a fresh event with a known subscriber so we have data to filter on
+        filter_sub = self._register_subscriber("e2e-filter", f"{self.receiver}/webhook")
+        mid = self._publish("e2e.filter", {"x": 1})
+        # Wait for delivery attempt to be created (doesn't need to be delivered)
+        def _attempt_exists():
+            r = self.client.get(
+                f"{self.api}/api/v1/deliveries",
+                params={"subscriber_id": filter_sub["id"]},
+            )
+            return r.json() if r.json() else None
+        attempts = self.poll(_attempt_exists, timeout=20, label="delivery attempt for filter_sub")
+        self.check("GET /deliveries?subscriber_id= returns results", bool(attempts))
+        if attempts:
+            self.check(
+                "all returned rows belong to that subscriber",
+                all(d["subscriber_id"] == filter_sub["id"] for d in attempts),
+            )
+
+        # ── GET /deliveries?status= filter ───────────────────────────────────
+        r7 = self.client.get(f"{self.api}/api/v1/deliveries", params={"status": "delivered"})
+        self.check("GET /deliveries?status=delivered → 200", r7.status_code == 200)
+        if r7.json():
+            self.check(
+                "all returned rows have status=delivered",
+                all(d["status"] == "delivered" for d in r7.json()),
+            )
+
+        # ── GET /deliveries?limit= ────────────────────────────────────────────
+        r8 = self.client.get(f"{self.api}/api/v1/deliveries", params={"limit": 2})
+        self.check("GET /deliveries?limit=2 → at most 2 results", len(r8.json()) <= 2)
+
+        # ── POST /deliveries/{id}/retry 409 on non-dead/failed ───────────────
+        # Find a delivered attempt from the happy-path run
+        r9 = self.client.get(f"{self.api}/api/v1/deliveries", params={"status": "delivered"})
+        delivered_rows = r9.json()
+        if delivered_rows:
+            delivery_id = delivered_rows[0]["id"]
+            r10 = self.client.post(f"{self.api}/api/v1/deliveries/{delivery_id}/retry")
+            self.check(
+                "POST /deliveries/{id}/retry on delivered attempt → 409",
+                r10.status_code == 409,
+            )
+
+        # ── POST /deliveries/{id}/retry 404 on unknown id ────────────────────
+        r11 = self.client.post(f"{self.api}/api/v1/deliveries/{uuid.uuid4()}/retry")
+        self.check("POST /deliveries/{id}/retry for unknown ID → 404", r11.status_code == 404)
+
     # ── Cleanup & summary ─────────────────────────────────────────────────────
 
     def _cleanup(self) -> None:
@@ -466,6 +549,7 @@ class E2ERunner:
         self.test_failed_delivery_and_retry()
         self.test_pipeline_stats()
         self.test_prometheus_metrics()
+        self.test_api_edge_cases()
 
         self._cleanup()
         return self._summary()

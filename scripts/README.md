@@ -30,6 +30,7 @@ python scripts/e2e_test.py --api http://api:8000 --receiver http://receiver:9001
 | 7 | Failed delivery → retry | Bad endpoint → `status=failed` → fix endpoint → `POST /deliveries/{id}/retry` → `delivered` |
 | 8 | Pipeline stats | `/pipeline/stats` reflects delivered count and event totals |
 | 9 | Prometheus metrics | `/metrics` exposes all named counters/histograms with non-zero values |
+| 10 | API edge cases | DELETE soft-deletes and returns 404 after; all 404 paths; `subscriber_id`/`status`/`limit` filters on `GET /deliveries`; 409 on retry of a delivered attempt |
 
 ## `publish_events.py`
 
