@@ -7,7 +7,15 @@ just plain HTTP calls against real services.
 
 Usage:
     python scripts/e2e_test.py
-    python scripts/e2e_test.py --api http://localhost:8000 --receiver http://localhost:9001
+    python scripts/e2e_test.py --api http://localhost:8000 \
+                               --receiver http://localhost:9001 \
+                               --subscriber-endpoint http://receiver:9001
+
+Note:
+    --receiver        is queried by this script (host-visible URL)
+    --subscriber-endpoint is stored in the DB and POSTed to by the delivery
+                      worker running inside Docker. Must use the Docker-internal
+                      service name, not localhost.
 
 Exit code:
     0  all scenarios passed
@@ -50,12 +58,15 @@ RESET  = "\033[0m"
 
 
 class E2ERunner:
-    def __init__(self, api_url: str, receiver_url: str) -> None:
-        self.api      = api_url.rstrip("/")
-        self.receiver = receiver_url.rstrip("/")
-        self.client   = httpx.Client(timeout=15.0)
-        self.passed   = 0
-        self.failed   = 0
+    def __init__(self, api_url: str, receiver_url: str, subscriber_endpoint: str) -> None:
+        self.api                 = api_url.rstrip("/")
+        self.receiver            = receiver_url.rstrip("/")
+        # URL the delivery worker (inside Docker) will POST to.
+        # Must be reachable from inside the Docker network, e.g. http://receiver:9001
+        self.subscriber_endpoint = subscriber_endpoint.rstrip("/")
+        self.client              = httpx.Client(timeout=15.0)
+        self.passed              = 0
+        self.failed              = 0
         self._cleanup_subs: list[str] = []
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -174,7 +185,7 @@ class E2ERunner:
         # Create
         r = self.client.post(f"{self.api}/api/v1/subscribers", json={
             "name": "e2e-primary",
-            "endpoint": f"{self.receiver}/webhook",
+            "endpoint": f"{self.subscriber_endpoint}/webhook",
         })
         self.check("POST /subscribers → 201", r.status_code == 201)
         sub = r.json()
@@ -189,7 +200,7 @@ class E2ERunner:
         self.check("GET does not expose secret", "secret" not in r2.json())
 
         # PATCH
-        new_endpoint = f"{self.receiver}/webhook"
+        new_endpoint = f"{self.subscriber_endpoint}/webhook"
         r3 = self.client.patch(f"{self.api}/api/v1/subscribers/{sub['id']}", json={"endpoint": new_endpoint})
         self.check("PATCH /subscribers/{id} → 200", r3.status_code == 200)
         self.check("endpoint updated", r3.json().get("endpoint") == new_endpoint)
@@ -269,7 +280,7 @@ class E2ERunner:
     def test_multiple_subscribers(self, subscriber_a: dict) -> None:
         self.section("5. Multiple Subscribers: one event → two deliveries")
 
-        sub_b = self._register_subscriber("e2e-secondary", f"{self.receiver}/webhook")
+        sub_b = self._register_subscriber("e2e-secondary", f"{self.subscriber_endpoint}/webhook")
 
         mid = self._publish("e2e.multi", {"x": 42})
 
@@ -355,7 +366,7 @@ class E2ERunner:
             # Fix the endpoint
             self.client.patch(
                 f"{self.api}/api/v1/subscribers/{dead_sub['id']}",
-                json={"endpoint": f"{self.receiver}/webhook"},
+                json={"endpoint": f"{self.subscriber_endpoint}/webhook"},
             )
 
             # Trigger manual retry
@@ -436,7 +447,7 @@ class E2ERunner:
         self.section("10. API Edge Cases & Full Endpoint Coverage")
 
         # ── DELETE /api/v1/subscribers/{id} ──────────────────────────────────
-        temp = self._register_subscriber("e2e-delete-me", f"{self.receiver}/webhook")
+        temp = self._register_subscriber("e2e-delete-me", f"{self.subscriber_endpoint}/webhook")
         temp_id = temp["id"]
         self._cleanup_subs.remove(temp_id)  # we'll delete it here explicitly
 
@@ -466,7 +477,7 @@ class E2ERunner:
 
         # ── GET /deliveries?subscriber_id= filter ────────────────────────────
         # Publish a fresh event with a known subscriber so we have data to filter on
-        filter_sub = self._register_subscriber("e2e-filter", f"{self.receiver}/webhook")
+        filter_sub = self._register_subscriber("e2e-filter", f"{self.subscriber_endpoint}/webhook")
         mid = self._publish("e2e.filter", {"x": 1})
         # Wait for delivery attempt to be created (doesn't need to be delivered)
         def _attempt_exists():
@@ -535,8 +546,9 @@ class E2ERunner:
 
     def run(self) -> bool:
         print(f"\n{BOLD}Event Processing & Distribution Service — E2E Test Suite{RESET}")
-        print(f"  API:      {self.api}")
-        print(f"  Receiver: {self.receiver}")
+        print(f"  API:                {self.api}")
+        print(f"  Receiver (query):   {self.receiver}")
+        print(f"  Subscriber endpoint:{self.subscriber_endpoint}  ← used by delivery worker")
 
         self.test_health()
 
@@ -562,12 +574,14 @@ def main() -> None:
         description="E2E smoke test for the event pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--api",      default="http://localhost:8000", help="API base URL")
-    parser.add_argument("--receiver", default="http://localhost:9001", help="Receiver base URL")
+    parser.add_argument("--api",      default="http://localhost:8000", help="API base URL (host-visible)")
+    parser.add_argument("--receiver", default="http://localhost:9001", help="Receiver base URL (host-visible, for querying received webhooks)")
+    parser.add_argument("--subscriber-endpoint", default="http://receiver:9001",
+                        help="Receiver URL as seen by the delivery worker inside Docker")
     args = parser.parse_args()
 
     try:
-        runner = E2ERunner(args.api, args.receiver)
+        runner = E2ERunner(args.api, args.receiver, args.subscriber_endpoint)
         ok = runner.run()
         sys.exit(0 if ok else 1)
     except httpx.ConnectError as exc:

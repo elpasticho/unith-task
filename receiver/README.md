@@ -25,11 +25,12 @@ curl http://localhost:9001/received
 
 # Each entry contains:
 # {
-#   "webhook_id": "<delivery_attempt_id>",
+#   "webhook_id":   "<delivery_attempt_id>",
 #   "timestamp_ms": "<unix_ms>",
-#   "signature": "sha256=...",
-#   "body": { "delivery_id": "...", "event_type": "...", "payload": {...} },
-#   "received_at": <unix_ms>
+#   "signature":    "sha256=...",
+#   "body":         { "delivery_id": "...", "event_type": "...", "payload": {...} },
+#   "raw_body":     "<original JSON string>",   ← preserved for HMAC verification
+#   "received_at":  <unix_ms>
 # }
 
 # Clear between tests
@@ -38,4 +39,4 @@ curl -X DELETE http://localhost:9001/received
 
 ## Note on signature verification
 
-The receiver logs the `X-Webhook-Signature` header but does not verify it — its job is observation, not enforcement. To test verification, use `app/delivery/signing.verify()` directly or write a custom receiver with the subscriber's secret.
+The receiver logs the `X-Webhook-Signature` header but does not verify it — its job is observation, not enforcement. The `raw_body` field stores the exact bytes that were signed, so external tools (like `scripts/e2e_test.py`) can reconstruct and verify the HMAC without re-serialising the parsed JSON (which could produce different byte ordering).

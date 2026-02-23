@@ -50,7 +50,7 @@ async def _insert_idempotency_key(
             INSERT INTO idempotency_keys
                 (message_id, event_type, raw_payload, status, received_at)
             VALUES
-                (:message_id, :event_type, :payload::jsonb, 'received', NOW())
+                (:message_id, :event_type, CAST(:payload AS jsonb), 'received', NOW())
             ON CONFLICT (message_id) DO NOTHING
             RETURNING message_id
             """

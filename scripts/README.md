@@ -26,18 +26,30 @@ bash scripts/stop.sh --volumes
 
 ## `e2e_test.py`
 
-End-to-end smoke test suite. Runs 9 scenarios against the live docker-compose stack via HTTP.
+End-to-end smoke test suite. Runs 10 scenarios against the live docker-compose stack via HTTP.
 No pytest, no testcontainers — just plain `httpx` calls.
 
 ```bash
-# Run against the default stack (API :8000, receiver :9001)
+# Run against the default docker-compose stack
 python scripts/e2e_test.py
 
-# Custom URLs (e.g. staging)
-python scripts/e2e_test.py --api http://api:8000 --receiver http://receiver:9001
+# All flags with their defaults shown explicitly
+python scripts/e2e_test.py \
+  --api http://localhost:8000 \
+  --receiver http://localhost:9001 \
+  --subscriber-endpoint http://receiver:9001
 ```
 
 **Exit codes:** `0` = all pass, `1` = failures, `2` = connection error (stack not running).
+
+**Important — two receiver URLs:**
+
+| Flag | Default | Used by |
+|------|---------|---------|
+| `--receiver` | `http://localhost:9001` | The test script itself, to query `GET /received` |
+| `--subscriber-endpoint` | `http://receiver:9001` | Stored in the DB; the delivery worker (inside Docker) POSTs to this URL |
+
+The delivery worker runs inside the Docker network where `localhost` resolves to its own container. Subscriber endpoints must use the Docker-internal service name (`receiver`), not `localhost`.
 
 **Scenarios covered:**
 

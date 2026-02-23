@@ -36,3 +36,6 @@ The main consumer loop and all message-handling logic.
 
 **Idempotency guarantee:**
 The `ON CONFLICT (message_id) DO NOTHING RETURNING *` pattern means duplicate detection is a single atomic DB operation with no SELECT-then-INSERT race condition. If the consumer crashes between the COMMIT and the ACK, RabbitMQ redelivers — the idempotency check catches it.
+
+**asyncpg / JSONB note:**
+The raw payload is inserted using `CAST(:payload AS jsonb)` rather than the PostgreSQL `::jsonb` shorthand. asyncpg's parameter parser misreads `:payload::jsonb` — it sees the `::` immediately after a named parameter and raises a syntax error. Standard SQL `CAST()` avoids this.

@@ -183,6 +183,7 @@ bash scripts/stop.sh
 bash scripts/stop.sh --volumes
 
 # Register a subscriber pointing at the test receiver
+# Use the Docker-internal hostname so the delivery worker can reach it
 curl -X POST http://localhost:8000/api/v1/subscribers \
   -H "Content-Type: application/json" \
   -d '{"name":"test","endpoint":"http://receiver:9001/webhook"}'
@@ -208,8 +209,9 @@ open http://localhost:15672   # guest / guest
 # Interactive API docs
 open http://localhost:8000/docs
 
-# Run the full E2E smoke test suite (9 scenarios)
-python scripts/e2e_test.py
+# Run the full E2E smoke test suite (10 scenarios, 78 checks)
+# --subscriber-endpoint must use the Docker-internal service name
+python scripts/e2e_test.py --subscriber-endpoint http://receiver:9001
 ```
 
 ---

@@ -17,7 +17,7 @@ log "Building and starting all services..."
 docker compose up --build -d
 
 log "Waiting for API to be ready..."
-until curl -sf http://localhost:8000/health/ready | grep -q '"status":"ok"' 2>/dev/null; do
+until curl -sf http://localhost:8000/health/ready 2>/dev/null | grep -q '"ok"'; do
   sleep 2
 done
 
